@@ -60,7 +60,6 @@ function _M.next_round_robin_server(servers, peer_cb)
 end
 
 
-
 function _M.free_round_robin_server(srv, failed)
     if not failed then
         return

@@ -1,16 +1,17 @@
 -- Copyright (C) 2014-2016 UPYUN, Inc.
 
 local cjson      = require "cjson.safe"
+local lrucache   = require "resty.lrucache.pureffi"
+local heartbeat  = require "resty.checkups.heartbeat"
+local dyconfig   = require "resty.checkups.dyconfig"
+local base       = require "resty.checkups.base"
+local try        = require "resty.checkups.try"
 
-local heartbeat       = require "resty.checkups.heartbeat"
-local dyconfig        = require "resty.checkups.dyconfig"
-local base            = require "resty.checkups.base"
-local try             = require "resty.checkups.try"
-local subsystem       = require "resty.subsystem"
-
-local str_format = string.format
 
 local localtime  = ngx.localtime
+local mutex      = ngx.shared.mutex
+local state      = ngx.shared.state
+local shd_config = ngx.shared.config
 local log        = ngx.log
 local now        = ngx.now
 local ERR        = ngx.ERR
@@ -18,20 +19,20 @@ local WARN       = ngx.WARN
 local INFO       = ngx.INFO
 local worker_id  = ngx.worker.id
 local get_phase  = ngx.get_phase
+local str_format = string.format
+local find       = string.find
 local type       = type
 local next       = next
 local pairs      = pairs
 local ipairs     = ipairs
-
-local get_shm    = subsystem.get_shm
-local mutex      = get_shm("mutex")
-local state      = get_shm("state")
-local shd_config = get_shm("config")
+local pcall      = pcall
 
 
 local _M = {
     _VERSION = "0.20",
-    STATUS_OK = base.STATUS_OK, STATUS_UNSTABLE = base.STATUS_UNSTABLE, STATUS_ERR = base.STATUS_ERR
+    STATUS_OK       = base.STATUS_OK,
+    STATUS_UNSTABLE = base.STATUS_UNSTABLE,
+    STATUS_ERR      = base.STATUS_ERR
 }
 
 
@@ -60,14 +61,14 @@ function _M.feedback_status(skey, host, port, failed)
 end
 
 
-function _M.ready_ok(skey, callback, opts)
+function _M.ready_ok(skey, callback, opts, upstream)
     opts = opts or {}
-    local ups = base.upstream.checkups[skey]
+    local ups = upstream or base.upstream.checkups[skey]
     if not ups then
         return nil, "unknown skey " .. skey
     end
 
-    return try.try_cluster(skey, callback, opts)
+    return try.try_cluster(skey, callback, opts, ups)
 end
 
 
@@ -77,20 +78,24 @@ function _M.init(config)
     end
 
     local skeys = {}
-    for skey, ups in pairs(config) do
+    for skey, ups in pairs(config) do repeat
         if type(ups) == "table" and type(ups.cluster) == "table" then
             for level, cls in pairs(ups.cluster) do
                 base.extract_servers_from_upstream(skey, cls)
             end
 
             local key = dyconfig._gen_shd_key(skey)
-            local ok, err = shd_config:set(key, cjson.encode(base.table_dup(ups)))
+
+            local encode_status, dup_ups = pcall(cjson.encode, base.table_dup(ups))
+            if encode_status == false then break end
+
+            local ok, err = shd_config:set(key, dup_ups)
             if not ok then
                 return nil, err
             end
         end
         skeys[skey] = 1
-    end
+    until true end
 
     local ok, err = shd_config:set(base.SHD_CONFIG_VERSION_KEY, 0)
     if not ok then
@@ -111,13 +116,17 @@ function _M.prepare_checker(config)
     base.upstream.conf_hash = config.global.conf_hash
     base.upstream.checkup_timer_interval = config.global.checkup_timer_interval or 5
     base.upstream.checkup_timer_overtime = config.global.checkup_timer_overtime or 60
-    base.upstream.checkups = {}
     base.upstream.ups_status_sync_enable = config.global.ups_status_sync_enable
     base.upstream.ups_status_timer_interval = config.global.ups_status_timer_interval or 5
     base.upstream.checkup_shd_sync_enable = config.global.checkup_shd_sync_enable
     base.upstream.shd_config_timer_interval = config.global.shd_config_timer_interval
         or base.upstream.checkup_timer_interval
     base.upstream.default_heartbeat_enable = config.global.default_heartbeat_enable
+
+    base.upstream.checkups = {}
+    local cluster_status = lrucache.new(config.global.cdn_lrucache_max_items or 1000)
+    local expired = config.global.cdn_srvs_status_expires or 300
+    base.init_cluster_status(cluster_status, expired)
 
     for skey, ups in pairs(config) do
         if type(ups) == "table" and type(ups.cluster) == "table" then
@@ -218,10 +227,10 @@ function _M.create_checker()
 end
 
 
-function _M.select_peer(skey)
+function _M.select_peer(skey, ups, opts)
     return _M.ready_ok(skey, function(host, port)
         return { host=host, port=port }
-    end)
+    end, opts, ups)
 end
 
 
@@ -245,14 +254,15 @@ local function gen_upstream(skey, upstream)
     end
 
     -- check servers
+    local ok
     for level, cls in pairs(ups.cluster) do
-        if type(cls) ~= "table" or not next(cls) then
+        if not cls or not next(cls) then
             return nil, "can not update empty level"
         end
 
         local servers = cls.servers
-        if type(servers) ~= "table" or not next(servers) then
-            return nil, "servers invalid"
+        if not servers or not next(servers) then
+            return nil, "can not update empty servers"
         end
 
         for _, srv in ipairs(servers) do
@@ -267,23 +277,8 @@ local function gen_upstream(skey, upstream)
 end
 
 
-function _M.get_upstream(skey)
-    local ups, err
-    if skey then
-        ups, err = dyconfig.do_get_upstream(skey)
-    else
-        ups, err = dyconfig.do_get_upstreams()
-    end
-
-    if err then
-        return nil, err
-    end
-    return ups
-end
-
-
 function _M.update_upstream(skey, upstream)
-    if type(upstream) ~= "table" or not next(upstream) then
+    if not upstream or not next(upstream) then
         return false, "can not set empty upstream"
     end
 

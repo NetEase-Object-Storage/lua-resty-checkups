@@ -3,7 +3,6 @@
 local cjson         = require "cjson.safe"
 
 local base          = require "resty.checkups.base"
-local subsystem     = require "resty.subsystem"
 
 local str_sub       = string.sub
 local lower         = string.lower
@@ -20,13 +19,9 @@ local WARN          = ngx.WARN
 local now           = ngx.now
 local tcp           = ngx.socket.tcp
 local update_time   = ngx.update_time
+local mutex         = ngx.shared.mutex
+local state         = ngx.shared.state
 
-local spawn         = ngx.thread.spawn
-local wait          = ngx.thread.wait
-
-local get_shm       = subsystem.get_shm
-local mutex         = get_shm("mutex")
-local state         = get_shm("state")
 
 local _M = {
     _VERSION = "0.11",
@@ -145,6 +140,13 @@ local heartbeat = {
             return redis_err, err
         end
 
+        if ups.password then
+            local ok, err = red:auth(ups.password)
+            if err then
+                log(WARN, "failed to auth to redis:", err)
+            end
+        end
+
         local res, err = red:ping()
         if not res then
             log(ERR, "failed to ping redis: ", id, ", ", err)
@@ -256,7 +258,6 @@ local heartbeat = {
             database = ups.name,
             user = ups.user,
             password = ups.pass,
-            charset = ups.charset,
             max_packet_size = 1024*1024
         }
 
@@ -448,15 +449,8 @@ function _M.active_checkup(premature)
         return
     end
 
-    local thread = {}
     for skey in pairs(base.upstream.checkups) do
-        thread[#thread + 1] = spawn(cluster_heartbeat, skey)
-    end
-
-    for _,v in ipairs(thread) do
-        if v then
-            wait(v)
-        end
+        cluster_heartbeat(skey)
     end
 
     local interval = base.upstream.checkup_timer_interval
