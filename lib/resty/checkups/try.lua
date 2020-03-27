@@ -23,8 +23,8 @@ local REQUEST_SUCCESS  = 1
 local EXCESS_TRY_LIMIT = 2
 
 
-local function prepare_callbacks(skey, opts)
-    local ups = base.upstream.checkups[skey]
+local function prepare_callbacks(skey, opts, upstream)
+    local ups = upstream or base.upstream.checkups[skey]
 
     -- calculate count of cluster and server
     local cls_keys = {}  -- string key or number level
@@ -71,8 +71,6 @@ local function prepare_callbacks(skey, opts)
             key = ngx.var.uri
         elseif mode == "ip_hash" then
             key = ngx.var.remote_addr
-        elseif mode == "header_hash" then
-            key = ngx.var.http_x_hash_key or ngx.var.uri
         end
 
         next_server_func = consistent_hash.next_consistent_hash_server
@@ -85,23 +83,26 @@ local function prepare_callbacks(skey, opts)
     -- check whether ther server is available
     local bad_servers = {}
     local peer_cb = function(index, srv)
-        local key = ("%s:%s:%s"):format(cls_key, srv.host, srv.port)
-        if bad_servers[key] then
-            return false
-        end
+        local key = ("%s:%s:%s:%s"):format(cls_key, srv.host, srv.port, srv.isp or "")
+        -- if bad_servers[key] then
+        --     return false
+        -- end
 
         if ups.enable == false or (ups.enable == nil
-            and base.upstream.default_heartbeat_enable == false) then
-            return base.get_srv_status(skey, srv) == base.STATUS_OK
+            and base.upstream.default_heartbeat_enable == false)
+        then
+            return base.get_srv_status(skey, srv, ups.id or "") == base.STATUS_OK
         end
 
         local peer_status = base.get_peer_status(skey, srv)
         if (not peer_status or peer_status.status ~= base.STATUS_ERR)
-        and base.get_srv_status(skey, srv) == base.STATUS_OK then
+            and base.get_srv_status(skey, srv, ups.id or "") == base.STATUS_OK
+        then
             return true
         end
     end
 
+    local retry_sleep = 0.05
 
     -- check whether need retry
     local statuses
@@ -123,6 +124,8 @@ local function prepare_callbacks(skey, opts)
         if try_cnt >= try_limit then
             return EXCESS_TRY_LIMIT
         end
+
+        ngx.sleep(try_cnt * retry_sleep)
 
         return NEED_RETRY
     end
@@ -149,9 +152,9 @@ local function prepare_callbacks(skey, opts)
         free_server_func = consistent_hash.free_consitent_hash_server
     end
     local set_status_cb = function(srv, failed)
-        local key = ("%s:%s:%s"):format(cls_key, srv.host, srv.port)
-        bad_servers[key] = failed
-        base.set_srv_status(skey, srv, failed)
+        local key = ("%s:%s:%s:%s"):format(cls_key, srv.host, srv.port, srv.isp or "")
+        -- bad_servers[key] = failed
+        base.set_srv_status(skey, srv, ups.id or "", failed, ups)
         free_server_func(srv, failed)
     end
 
@@ -167,7 +170,6 @@ local function prepare_callbacks(skey, opts)
 end
 
 
-
 --[[
 parameters:
     - (string) skey
@@ -180,8 +182,8 @@ return:
     - (string) result
     - (string) error
 --]]
-function _M.try_cluster(skey, request_cb, opts)
-    local callbacks = prepare_callbacks(skey, opts)
+function _M.try_cluster(skey, request_cb, opts, upstream)
+    local callbacks = prepare_callbacks(skey, opts, upstream)
 
     local next_cluster_cb = callbacks.next_cluster_cb
     local next_server_cb  = callbacks.next_server_cb
@@ -206,13 +208,15 @@ function _M.try_cluster(skey, request_cb, opts)
         for srv, err in itersrvs(cls.servers, peer_cb) do
             -- exec request callback by server
             local start_time = now()
-            res, err = request_cb(srv.host, srv.port)
+            local args = opts.args or { srv }
+            res, err = request_cb(srv.host, srv.port, unpack(args))
+
+            local feedback = retry_cb(res)
 
             -- check whether need retry
             local end_time = now()
             local delta_time = end_time - start_time
 
-            local feedback = retry_cb(res)
             set_status_cb(srv, feedback ~= REQUEST_SUCCESS) -- set some status
             if feedback ~= NEED_RETRY then
                 return res, err

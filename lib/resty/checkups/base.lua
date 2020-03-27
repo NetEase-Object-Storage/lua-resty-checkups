@@ -1,34 +1,31 @@
 -- Copyright (C) 2014-2016 UPYUN, Inc.
 
-local cjson         = require "cjson.safe"
+local cjson      = require "cjson.safe"
+local lock       = require "resty.lock"
 
-local lock          = require "resty.lock"
-local subsystem     = require "resty.subsystem"
+local str_format = string.format
+local str_sub    = string.sub
+local str_find   = string.find
+local str_match  = string.match
+local tab_insert = table.insert
+local unpack     = unpack
+local tostring   = tostring
+local ipairs     = ipairs
+local pairs      = pairs
+local type       = type
 
-local str_format    = string.format
-local str_sub       = string.sub
-local str_find      = string.find
-local str_match     = string.match
-local tab_insert    = table.insert
-local unpack        = unpack
-local tostring      = tostring
-local ipairs        = ipairs
-local pairs         = pairs
-local type          = type
-
-local log           = ngx.log
-local ERR           = ngx.ERR
-local WARN          = ngx.WARN
-local now           = ngx.now
-
-local get_shm       = subsystem.get_shm
-local get_shm_key   = subsystem.get_shm_key
-local state         = get_shm("state")
+local log        = ngx.log
+local ERR        = ngx.ERR
+local WARN       = ngx.WARN
+local state      = ngx.shared.state
+local now        = ngx.now
 
 
 local _M = {
     _VERSION = "0.20",
-    STATUS_OK = 0, STATUS_UNSTABLE = 1, STATUS_ERR = 2
+    STATUS_OK = 0,
+    STATUS_UNSTABLE = 1,
+    STATUS_ERR = 2
 }
 
 local ngx_upstream
@@ -53,10 +50,11 @@ local upstream = {}
 _M.upstream = upstream
 local peer_id_dict = {}
 
+local expired
+local cluster_status
+
 local ups_status_timer_created
 _M.ups_status_timer_created = ups_status_timer_created
-local cluster_status = {}
-_M.cluster_status = cluster_status
 
 
 _M.is_tab = function(t) return type(t) == "table" end
@@ -90,13 +88,19 @@ local function extract_srv_host_port(name)
 end
 
 
-function _M.get_srv_status(skey, srv)
-    local server_status = cluster_status[skey]
+function _M.init_cluster_status(_cluster_status, _expired)
+    expired = _expired
+    cluster_status = _cluster_status
+end
+
+
+function _M.get_srv_status(skey, srv, id)
+    local server_status = cluster_status:get(skey)
     if not server_status then
         return _M.STATUS_OK
     end
 
-    local srv_key = str_format("%s:%d", srv.host, srv.port)
+    local srv_key = str_format("%s:%d:%s:%s", srv.host, srv.port, srv.isp or "", id)
     local srv_status = server_status[srv_key]
     local fail_timeout = srv.fail_timeout or 10
 
@@ -108,11 +112,11 @@ function _M.get_srv_status(skey, srv)
 end
 
 
-function _M.set_srv_status(skey, srv, failed)
-    local server_status = cluster_status[skey]
+function _M.set_srv_status(skey, srv, id, failed, _ups)
+    local server_status = cluster_status:get(skey)
     if not server_status then
         server_status = {}
-        cluster_status[skey] = server_status
+        cluster_status:set(skey, server_status, expired)
     end
 
     -- The default max_fails is 0, which differs from nginx upstream module(1).
@@ -123,7 +127,7 @@ function _M.set_srv_status(skey, srv, failed)
     end
 
     local time_now = now()
-    local srv_key = str_format("%s:%d", srv.host, srv.port)
+    local srv_key = str_format("%s:%d:%s:%s", srv.host, srv.port, srv.isp or "", id)
     local srv_status = server_status[srv_key]
     if not srv_status then  -- first set
         srv_status = {
@@ -142,14 +146,15 @@ function _M.set_srv_status(skey, srv, failed)
         srv_status.failed_count = srv_status.failed_count + 1
 
         if srv_status.failed_count >= max_fails then
-            local ups = upstream.checkups[skey]
+            local ups = _ups or upstream.checkups[skey]
             for level, cls in pairs(ups.cluster) do
                 for _, s in ipairs(cls.servers) do
-                    local k = str_format("%s:%d", s.host, s.port)
+                    local k = str_format("%s:%d:%s:%s", s.host, s.port, s.isp or "", id)
                     local st = server_status[k]
                     -- not the last ok server
-                    if not st or st.status == _M.STATUS_OK and k ~= srv_key then
+                    if (not st or st.status == _M.STATUS_OK) and k ~= srv_key then
                         srv_status.status = _M.STATUS_ERR
+                        srv_status.lastmodify = time_now
                         return
                     end
                 end
@@ -159,47 +164,8 @@ function _M.set_srv_status(skey, srv, failed)
 end
 
 
-function _M.check_res(res, check_opts)
-    if res then
-        local typ = check_opts.typ
-
-        if typ == "http" and type(res) == "table"
-        and res.status then
-            local status = tostring(res.status)
-            local http_opts = check_opts.http_opts
-            if http_opts and http_opts.statuses and
-                http_opts.statuses[status] == false then
-                return false
-            end
-        end
-        return true
-    end
-
-    return false
-end
-
-
-function _M.try_server(skey, ups, srv, callback, args, try)
-    try = try or 1
-    local peer_key = _gen_key(skey, srv)
-    local peer_status = cjson.decode(state:get(PEER_STATUS_PREFIX .. peer_key))
-    local res, err
-
-    if peer_status == nil or peer_status.status ~= _M.STATUS_ERR then
-        for i = 1, try, 1 do
-            res, err = callback(srv.host, srv.port, unpack(args))
-            if _M.check_res(res, ups) then
-                return res
-            end
-        end
-    end
-
-    return nil, err
-end
-
-
 function _M.get_lock(key, timeout)
-    local lock = lock:new(get_shm_key("locks"), {timeout=timeout})
+    local lock = lock:new("locks", {timeout=timeout})
     local elapsed, err = lock:lock(key)
     if not elapsed then
         log(WARN, "failed to acquire the lock: ", key, ", ", err)
@@ -283,22 +249,17 @@ function _M.extract_servers_from_upstream(skey, cls)
     end
 
     local ups_backup = cls.upstream_only_backup
-    local ups_skip_down = cls.upstream_skip_down
     local srvs_getter = ngx_upstream.get_primary_peers
     if ups_backup then
         srvs_getter = ngx_upstream.get_backup_peers
     end
     local srvs, err = srvs_getter(up_key)
     if not srvs and err then
-        log(ERR, "failed to get servers in upstream ", err)
+        log(ERR, "failed to get servers in upstream, key: ", up_key, " err:",  err)
         return
     end
 
     for _, srv in ipairs(srvs) do
-        if ups_skip_down and srv.down then
-            goto continue
-        end
-
         local host, port = extract_srv_host_port(srv.name)
         if not host then
             log(ERR, "invalid server name: ", srv.name)
@@ -313,8 +274,6 @@ function _M.extract_servers_from_upstream(skey, cls)
             max_fails = srv.max_fails,
             fail_timeout = srv.fail_timeout,
         })
-
-        ::continue::
     end
 end
 
